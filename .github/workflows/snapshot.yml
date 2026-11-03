@@ -12,10 +12,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Probe Sleeper GraphQL
         run: |
-          mkdir -p debug/probe4
+          mkdir -p debug/probe5
           G=https://sleeper.com/graphql
-          q() { curl -s -H Content-Type:application/json -H Origin:https://sleeper.com -X POST $G --data "$2" > debug/probe4/$1.json; }
-          q events '{"query":"query q { league_event_logs(league_id: \"1342346419675078656\", limit: 200) }"}'
+          q() { curl -s -H Content-Type:application/json -H Origin:https://sleeper.com -X POST $G --data "$2" > debug/probe5/$1.json; }
+          q events '{"query":"query q { league_event_logs(league_id: \"1342346419675078656\", limit: 200) { event_type created data } }"}'
           q events_type '{"query":"{ __type(name: \"LeagueEventLog\") { fields { name } } }"}'
           q ql_args '{"query":"{ __schema { query_type { fields { name type { name kind of_type { name } } } } } }"}'
       - name: Commit
