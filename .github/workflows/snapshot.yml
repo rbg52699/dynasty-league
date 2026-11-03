@@ -10,27 +10,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Download raw league data
+      - name: Probe Sleeper GraphQL
         run: |
-          set -e
-          mkdir -p debug
-          API=https://api.sleeper.app/v1
-          ID=1342346419675078656
-          curl -sf $API/state/nba > debug/state.json
-          i=0
-          while [ -n "$ID" ] && [ "$ID" != "null" ] && [ "$ID" != "0" ] && [ $i -lt 10 ]; do
-            d=debug/league_$ID; mkdir -p $d
-            curl -sf $API/league/$ID > $d/league.json
-            curl -sf $API/league/$ID/users > $d/users.json
-            curl -sf $API/league/$ID/rosters > $d/rosters.json
-            curl -sf $API/league/$ID/winners_bracket > $d/winners_bracket.json || true
-            for w in 1 2 3 4; do curl -sf $API/league/$ID/matchups/$w > $d/matchups_$w.json || true; done
-            ID=$(jq -r '.previous_league_id' $d/league.json); i=$((i+1))
-          done
-      - name: Commit snapshot
+          mkdir -p debug/probe
+          G=https://sleeper.com/graphql
+          H='-H Content-Type:application/json -H Origin:https://sleeper.com -H Referer:https://sleeper.com/'
+          curl -s $H -X POST $G -d '{"query":"{ __schema { queryType { fields { name args { name } } } } }"}' > debug/probe/schema.json || true
+          curl -s $H -X POST $G -d '{"operationName":"q","variables":{},"query":"query q { matchup_legs(league_id: \"1342346419675078656\", round: 2) { roster_id points starters starters_points player_map } }"}' > debug/probe/legs.json || true
+          curl -s $H -X POST $G -d '{"operationName":"q","variables":{},"query":"query q { league_rosters(league_id: \"1342346419675078656\") { roster_id settings } }"}' > debug/probe/rosters.json || true
+          curl -s https://api.sleeper.com/league/1342346419675078656/matchups/2 > debug/probe/apicom_matchups.json || true
+          head -c 600 debug/probe/*.json
+      - name: Commit
         run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@users.noreply.github.com"
-          git add debug
-          git commit -m "Sleeper data snapshot" || echo "nothing to commit"
-          git push
+          git config user.name "github-actions"; git config user.email "github-actions@users.noreply.github.com"
+          git add debug; git commit -m "Sleeper probe" || true; git push
