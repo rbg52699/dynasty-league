@@ -1,0 +1,1 @@
+{"errors":[{"message":"Cannot query field \"queryType\" on type \"__Schema\". Did you mean \"query_type\"?","locations":[{"line":1,"column":0}]}]}
