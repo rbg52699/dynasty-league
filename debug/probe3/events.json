@@ -1,1 +1,0 @@
-{"errors":[{"message":"Field \"league_event_logs\" of type \"[LeagueEventLog]\" must have a selection of subfields. Did you mean \"league_event_logs { ... }\"?","locations":[{"line":1,"column":0}]}]}

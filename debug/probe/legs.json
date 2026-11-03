@@ -1,1 +1,0 @@
-{"errors":[{"message":"Cannot query field \"starters_points\" on type \"MatchupLeg\". Did you mean \"roster_id\", \"proj_points\", \"max_points\", \"starters_games\", or \"starters\"?","locations":[{"line":1,"column":0}]}]}
