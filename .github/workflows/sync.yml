@@ -1,10 +1,13 @@
 name: Sync lock-in scores
-# runs every 5 minutes; also on demand
+# Every 5 minutes (GitHub's minimum); each run re-checks Sleeper about once a
+# minute for ~5 minutes. Data goes to the `data` branch so the site itself
+# doesn't rebuild on every update.
 on:
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
   push:
+    branches: [main]
     paths: ["scripts/sync.py", ".github/workflows/sync.yml"]
 permissions:
   contents: write
@@ -14,17 +17,29 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Pull lock-in data from Sleeper
+      - name: Check out data branch
+        run: |
+          git fetch -q origin data
+          git worktree add -q store FETCH_HEAD
+          cd store && git checkout -q -B data
+      - name: Sync about once a minute
         env:
           SLEEPER_TOKEN: ${{ secrets.SLEEPER_TOKEN }}
-        run: python3 scripts/sync.py
-      - name: Save changes
         run: |
+          cd store
           git config user.name "league-sync"
           git config user.email "league-sync@users.noreply.github.com"
-          git add data || true
-          if git diff --cached --quiet; then echo "no changes"; exit 0; fi
-          git commit -qm "Sync lock-in scores"
-          git pull -q --rebase origin main && git push -q
+          end=$((SECONDS + 270))
+          while :; do
+            python3 ../scripts/sync.py || echo "sync failed, will retry"
+            git add data
+            if ! git diff --cached --quiet; then
+              git commit -qm "Sync lock-in scores"
+              git push -q origin data || (git pull -q --rebase origin data && git push -q origin data) || true
+            fi
+            [ $SECONDS -ge $end ] && break
+            sleep 50
+          done

@@ -191,7 +191,9 @@ def main():
         weeks = sorted(int(f[:-5]) for f in os.listdir(f"data/w/{lid}")) if os.path.isdir(f"data/w/{lid}") else []
         index[lid] = {"season": str(L["season"]), "weeks": weeks, "live": live}
         print(f"{L['season']}: {len(weeks)} weeks, {mism} mismatched team-weeks")
-    changed += write("data/index.json", {"v": V, "leagues": index, "updated": int(time.time() * 1000)})
+    old = load("data/index.json") or {}
+    if changed or old.get("leagues") != index or old.get("v") != V:
+        changed += write("data/index.json", {"v": V, "leagues": index, "updated": int(time.time() * 1000)})
     print(f"done, {changed} file(s) changed")
 
 
