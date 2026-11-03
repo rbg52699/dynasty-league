@@ -159,7 +159,7 @@ const LEAGUE_ID = "1342346419675078656";
 const API = "https://api.sleeper.app/v1";
 const REFRESH_MS = 60_000;
 const SIMS = 4000;
-const CACHE_V = "v1";
+const CACHE_V = "v2";
 
 /* ================= utils ================= */
 const D = { players:{}, state:null, seasons:[], cur:null, R:null, sim:null, open:new Set(), sort:{k:"titles",d:-1}, reqs:0, done:0 };
@@ -196,7 +196,8 @@ async function loadPlayers(){
   store.set("sl_players_nba",{t:Date.now(),p});
   return p;
 }
-const cM = m => ({r:m.roster_id, m:m.matchup_id, p:m.points||0, s:m.starters||[], sp:m.starters_points||[], pl:m.players||[], pp:m.players_points||{}});
+const starterSum = m => (m.starters_points && m.starters_points.length) ? Math.round(m.starters_points.reduce((a,x)=>a+(+x||0),0)*100)/100 : (m.points||0);
+const cM = m => ({r:m.roster_id, m:m.matchup_id, p:starterSum(m), s:m.starters||[], sp:m.starters_points||[], pl:m.players||[], pp:m.players_points||{}});
 const cT = t => ({t:t.type, c:t.status_updated||t.created||0, a:t.adds||null, d:t.drops||null, r:t.roster_ids||[], dp:(t.draft_picks||[]).map(p=>({s:p.season,r:p.round,o:p.owner_id,f:p.previous_owner_id}))});
 
 async function loadSeason(L){
@@ -213,9 +214,9 @@ async function loadSeason(L){
   const maxW = done ? Math.min(30, (L.settings||{}).last_scored_leg || 25) : Math.max(liveWeek, pws ? pws-1 : 0);
   const wk = await pool(Array.from({length:maxW},(_,i)=>()=>j(`/league/${id}/matchups/${i+1}`).catch(()=>[])));
   const weeks = {}; wk.forEach((a,i)=>{ if (a && a.length) weeks[i+1] = a.map(cM); });
-  const txW = done ? maxW : Math.max(liveWeek,1);
-  const tx = (await pool(Array.from({length:txW},(_,i)=>()=>j(`/league/${id}/transactions/${i+1}`).catch(()=>[]))))
-              .flat().filter(t=>t && t.status==="complete").map(cT);
+  const seenTx = new Set();
+  const tx = (await pool(Array.from({length:31},(_,i)=>()=>j(`/league/${id}/transactions/${i}`).catch(()=>[]))))
+              .flat().filter(t=>{ if (!t || t.status!=="complete") return false; const k=t.transaction_id||`${t.created}|${JSON.stringify(t.adds)}|${JSON.stringify(t.drops)}`; if (seenTx.has(k)) return false; seenTx.add(k); return true; }).map(cT);
   const s = { id, year:String(L.season), users, rosters, weeks, wb:wb||[], lb:lb||[], tx, liveWeek };
   if (done) store.set(key, s);
   return { ...s, L, isCurrent };
@@ -269,7 +270,8 @@ const standSort = (a,b) => (b.w+b.t/2)-(a.w+a.t/2) || b.pf-a.pf;
 function build(){
   const M = {};
   const mgr = oid => M[oid] ||= { id:oid, name:"", handle:"", av:"", w:0,l:0,t:0,pf:0,pa:0, titles:0, finals:0, po:0, poW:0, poL:0, act:0, opt:0, gp:0, moves:0, trades:0, seasons:0, finish:{}, h2h:{}, best:0, worst:Infinity, active:false };
-  const R = { tw:[], games:[], pl:[], bench:[], adds:{}, drops:{}, trades:[] };
+  const R = { tw:[], games:[], pl:[], bench:[], adds:{}, drops:{}, trades:[], mister:{} };
+  const mis = (k,pid) => ((R.mister[k] ||= {})[pid] ||= {a:0,d:0,tm:new Set()});
   for (const s of D.seasons) {
     const S = s.L.settings || {};
     s.pws = +S.playoff_week_start || 99;
@@ -325,8 +327,10 @@ function build(){
     }
     // transactions
     for (const t of s.tx) {
-      for (const pid of Object.keys(t.a||{})) R.adds[pid] = (R.adds[pid]||0)+1;
-      for (const pid of Object.keys(t.d||{})) R.drops[pid] = (R.drops[pid]||0)+1;
+      if (t.t!=="trade") {
+        for (const [pid,rid] of Object.entries(t.a||{})) { R.adds[pid]=(R.adds[pid]||0)+1; for (const k of ["all",s.year]) { const x=mis(k,pid); x.a++; x.tm.add(s.own[rid]); } }
+        for (const [pid,rid] of Object.entries(t.d||{})) { R.drops[pid]=(R.drops[pid]||0)+1; for (const k of ["all",s.year]) { const x=mis(k,pid); x.d++; x.tm.add(s.own[rid]); } }
+      }
       for (const rid of t.r) { const m = mgr(s.own[rid]); if (t.t==="trade") m.trades++; else m.moves++; }
       if (t.t==="trade") R.trades.push({ t, s });
     }
@@ -645,26 +649,65 @@ function vHistory(){
   return `${banner}${sec("Season over season")}${grid}${sec("Season by season")}<div class="grid c3">${cards}</div>`;
 }
 
+function misterRank(k){ return Object.entries(D.R.mister[k]||{}).map(([pid,x])=>({pid,...x,n:x.a+x.d})).sort((a,b)=>b.n-a.n || b.tm.size-a.tm.size || b.a-a.a); }
 function vMoves(){
   const R = D.R;
   const top = (obj) => Object.entries(obj).sort((a,b)=>b[1]-a[1]).slice(0,15);
-  const plist = (arr, cls) => arr.length ? arr.map(([pid,n],i)=>li(i+1, esc(pname(pid)), `${esc(((D.players[pid]||{}).pos||[]).join("/"))} · ${esc((D.players[pid]||{}).tm||"")}`, `<span class="${cls}">${n}</span>`)).join("") : `<div class="muted">Nothing yet.</div>`;
+  const pmeta = pid => `${esc(((D.players[pid]||{}).pos||[]).join("/"))} · ${esc((D.players[pid]||{}).tm||"")}`;
+  const plist = (arr, cls) => arr.length ? arr.map(([pid,n],i)=>li(i+1, esc(pname(pid)), pmeta(pid), `<span class="${cls}">${n}</span>`)).join("") : `<div class="muted">Nothing yet.</div>`;
   const ms = Object.values(D.M).filter(m=>m.moves);
   const busy = [...ms].sort((a,b)=>b.moves-a.moves).slice(0,10).map((m,i)=>li(i+1, esc(m.name), `@${esc(m.handle)} · ${m.trades} trades`, m.moves)).join("") || `<div class="muted">Nothing yet.</div>`;
-  const trades = R.trades.slice(0,12).map(({t,s})=>{
+
+  // ---- The Mister Award ----
+  const years = D.seasons.filter(s=>R.mister[s.year]).map(s=>s.year).reverse();
+  if (!years.includes(D.misterYear)) D.misterYear = years[0];
+  const allR = misterRank("all"), yrR = misterRank(D.misterYear);
+  const winner = (x, label) => x ? `<div style="flex:1;min-width:260px">
+      <div class="k">${label}</div>
+      <div class="disp gold" style="font-size:44px;line-height:1;margin-top:8px">${esc(pname(x.pid))}</div>
+      <div class="muted" style="margin-top:4px">${pmeta(x.pid)}</div>
+      <div style="display:flex;gap:18px;margin-top:12px;flex-wrap:wrap">
+        <div><div class="disp" style="font-size:30px">${x.n}</div><div class="th">total moves</div></div>
+        <div><div class="disp add" style="font-size:30px">${x.a}</div><div class="th">times added</div></div>
+        <div><div class="disp drop" style="font-size:30px">${x.d}</div><div class="th">times dropped</div></div>
+        <div><div class="disp" style="font-size:30px">${x.tm.size}</div><div class="th">teams</div></div>
+      </div></div>` : `<div style="flex:1;min-width:260px"><div class="k">${label}</div><div class="muted" style="margin-top:8px">No moves yet.</div></div>`;
+  const board = (arr) => arr.slice(0,8).map((x,i)=>li(i+1, `${i===0?"🏅 ":""}${esc(pname(x.pid))}`, `${pmeta(x.pid)} · <span class="add">+${x.a}</span> / <span class="drop">−${x.d}</span> · ${x.tm.size} team${x.tm.size===1?"":"s"}`, x.n)).join("") || `<div class="muted">Nothing yet.</div>`;
+  const yrSel = years.length ? `<select data-mister>${years.map(y=>`<option ${y===D.misterYear?"selected":""}>${y}</option>`).join("")}</select>` : "";
+  const mister = `<div class="hero" style="flex-direction:column;align-items:stretch">
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap"><span style="font-size:34px">🏅</span><div><div class="big disp">The Mister Award</div><div class="muted">For the player this league can't decide on: most combined adds and drops (waivers and free agency).</div></div></div>
+      <div style="display:flex;gap:30px;flex-wrap:wrap;margin-top:18px">${winner(allR[0], "All-time Mister")}${winner(yrR[0], `${D.misterYear||""} Mister`)}</div>
+    </div>
+    <div class="grid c2" style="margin-top:16px">
+      <div class="card"><div class="k">All-time Mister race</div><div style="margin-top:6px">${board(allR)}</div></div>
+      <div class="card"><div style="display:flex;justify-content:space-between;align-items:center"><div class="k">Season Mister race</div>${yrSel}</div><div style="margin-top:6px">${board(yrR)}</div></div>
+    </div>`;
+
+  // ---- Trade log (every trade, grouped by season) ----
+  const tyears = [...new Set(R.trades.map(x=>x.s.year))];
+  const ty = D.tradeYear && tyears.includes(D.tradeYear) ? D.tradeYear : "all";
+  const shown = R.trades.filter(x=>ty==="all" || x.s.year===ty);
+  let lastYr = null;
+  const trades = shown.map(({t,s})=>{
+    const head = s.year !== lastYr ? `<div class="disp" style="font-size:26px;margin:${lastYr?"18px":"0"} 0 2px">${s.year} season <span class="muted" style="font-family:Inter;font-size:13px">${shown.filter(x=>x.s===s).length} trades</span></div>` : "";
+    lastYr = s.year;
     const sides = t.r.map(rid=>{
       const gets = Object.entries(t.a||{}).filter(([,r])=>r===rid).map(([p])=>`<div class="add">+ ${esc(pname(p))}</div>`).join("");
       const picks = t.dp.filter(p=>p.o===rid).map(p=>`<div class="add">+ ${esc(p.s)} round ${p.r} pick</div>`).join("");
       return `<div style="flex:1;min-width:200px">${chip(s,rid)}<div style="margin:6px 0 0 40px;font-size:13px">${gets}${picks || (gets?"":"<span class='muted'>—</span>")}</div></div>`;
     }).join("");
-    return `<div class="trd"><div style="width:110px"><span class="pill trade">Trade</span><div class="th" style="margin-top:6px">${new Date(t.c).toLocaleDateString()}</div></div>${sides}</div>`;
+    return `${head}<div class="trd"><div style="width:110px"><span class="pill trade">Trade</span><div class="th" style="margin-top:6px">${t.c?new Date(t.c).toLocaleDateString():""}</div></div>${sides}</div>`;
   }).join("");
-  return `<div class="grid c3">
-      <div class="card"><div class="k">📥 Most added players</div><div class="muted" style="font-size:12px;margin:2px 0 6px">Times picked up, all seasons</div>${plist(top(R.adds),"pos")}</div>
+  const tSel = tyears.length > 1 ? `<select data-tradeyr style="margin-left:auto"><option value="all">All seasons</option>${tyears.map(y=>`<option ${y===ty?"selected":""}>${y}</option>`).join("")}</select>` : "";
+
+  return `${mister}
+    ${sec("Waiver wire")}
+    <div class="grid c3">
+      <div class="card"><div class="k">📥 Most added players</div><div class="muted" style="font-size:12px;margin:2px 0 6px">Waiver and free-agent pickups, all seasons</div>${plist(top(R.adds),"pos")}</div>
       <div class="card"><div class="k">🗑️ Most dropped players</div><div class="muted" style="font-size:12px;margin:2px 0 6px">Times cut, all seasons</div>${plist(top(R.drops),"neg")}</div>
       <div class="card"><div class="k">🔁 Busiest managers</div><div class="muted" style="font-size:12px;margin:2px 0 6px">Waiver and free-agent moves</div>${busy}</div>
     </div>
-    ${sec("Trade log", `${R.trades.length} trades all time`)}<div class="card">${trades || `<div class="muted">No trades yet. Somebody make an offer.</div>`}</div>`;
+    <div class="sec"><h2 class="disp">Trade log</h2><span class="muted">${R.trades.length} trades all time</span>${tSel}</div><div class="card">${trades || `<div class="muted">No trades yet. Somebody make an offer.</div>`}</div>`;
 }
 
 /* ================= shell ================= */
@@ -700,6 +743,10 @@ document.addEventListener("click", e => {
   if (th) { const k = th.dataset.sort; D.sort = { k, d: D.sort.k===k ? -D.sort.d : (k==="name"?1:-1) }; render(); return; }
   const mc = e.target.closest(".mc");
   if (mc) { const k = mc.dataset.k; D.open.has(k) ? D.open.delete(k) : D.open.add(k); mc.classList.toggle("open"); }
+});
+document.addEventListener("change", e => {
+  if (e.target.matches("select[data-mister]")) { D.misterYear = e.target.value; render(); }
+  if (e.target.matches("select[data-tradeyr]")) { D.tradeYear = e.target.value; render(); }
 });
 window.addEventListener("hashchange", () => { render(); window.scrollTo(0,0); });
 let busy = false;
