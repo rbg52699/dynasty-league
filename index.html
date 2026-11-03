@@ -294,12 +294,17 @@ async function refreshLive(){
   s.liveWeek = (L.status==="in_season" && sameSeason) ? (D.state.display_week || D.state.week || 0) : 0;
   const [rosters, users] = await Promise.all([j(`/league/${id}/rosters`), j(`/league/${id}/users`)]);
   s.rosters = rosters; s.users = users;
-  const sha = await dataSha();
-  if (D.idx && sha && sha !== D.sha) {
-    D.sha = sha;
-    D.idx = await dataGet("data/index.json").catch(()=>D.idx);
-    const li = D.idx.leagues[id];
-    if (li) { const ws = li.weeks.filter(w=>w >= (s.liveWeek||li.live) - 1); Object.assign(s.weeks, await lockWeeks(id, ws)); }
+  if (D.idx && Date.now() - (D.shaChecked||0) > 110_000) {
+    D.shaChecked = Date.now();
+    const sha = await dataSha();
+    let idx = null;
+    if (sha && sha !== D.sha) { D.sha = sha; idx = await dataGet("data/index.json").catch(()=>null); }
+    else if (!sha) { D.sha = null; idx = await dataGet("data/index.json").catch(()=>null); }
+    if (idx && idx.updated !== D.idx.updated) {
+      D.idx = idx;
+      const li = D.idx.leagues[id];
+      if (li) { const ws = li.weeks.filter(w=>w >= (s.liveWeek||li.live) - 1); Object.assign(s.weeks, await lockWeeks(id, ws)); }
+    }
   } else if (!D.idx && s.liveWeek) {
     const m = await j(`/league/${id}/matchups/${s.liveWeek}`); if (m && m.length) s.weeks[s.liveWeek] = m.map(cM);
   }
@@ -560,7 +565,9 @@ function matchCard(g, gotw){
   const status = g.complete ? `<span class="badge final">Final</span>` : g.live ? `<span class="badge live">● Live</span>` : `<span class="badge">Upcoming</span>`;
   const side = (x, p, me, other) => {
     const fav = p >= 0.5;
-    return `<div class="row">${chip(s, x.r, `${rec(s,x.r)}${g.complete?"":` · <b class="${fav?"pos":"gold"}">${american(p)}</b> · ${pct(p)}`}`)}
+    const nS = x.s.filter(id=>id&&id!=="0").length, nL = x.lock ? Object.values(x.lk||{}).filter(v=>v==="L").length : 0;
+    const lockTxt = x.lock && g.live ? ` · <span style="color:var(--green)">🔒 ${nL}/${nS}</span>` : "";
+    return `<div class="row">${chip(s, x.r, `${rec(s,x.r)}${g.complete?"":` · <b class="${fav?"pos":"gold"}">${american(p)}</b> · ${pct(p)}`}${lockTxt}`)}
       <span class="score disp ${(g.live||g.complete) && me>other?"lead":""}">${f2(me)}</span></div>`;
   };
   const sp = L.ea - L.eb, fav = sp >= 0 ? g.a : g.b;

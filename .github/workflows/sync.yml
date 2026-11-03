@@ -1,6 +1,7 @@
 name: Sync lock-in scores
-# Every 5 minutes (GitHub's minimum); each run re-checks Sleeper about once a
-# minute for ~5 minutes. Data goes to the `data` branch so the site itself
+# Started every 5 minutes (GitHub's minimum, often delayed); each run keeps
+# re-checking Sleeper about once a minute for ~55 minutes, so syncing is
+# continuous even when GitHub's schedule is late. Data goes to the `data` branch so the site itself
 # doesn't rebuild on every update.
 on:
   schedule:
@@ -17,7 +18,7 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 70
     steps:
       - uses: actions/checkout@v4
       - name: Check out data branch
@@ -32,7 +33,7 @@ jobs:
           cd store
           git config user.name "league-sync"
           git config user.email "league-sync@users.noreply.github.com"
-          end=$((SECONDS + 270))
+          end=$((SECONDS + 3300))
           while :; do
             python3 ../scripts/sync.py || echo "sync failed, will retry"
             git add data
