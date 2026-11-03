@@ -16,7 +16,7 @@ LEAGUE_ID = "1342346419675078656"
 REST = "https://api.sleeper.app/v1"
 GQL = "https://sleeper.com/graphql"
 TOKEN = os.environ.get("SLEEPER_TOKEN", "").strip()
-V = 2  # bump to force every week to be rebuilt
+V = 3  # bump to force every week to be rebuilt
 
 
 def _req(req, tries=4):
@@ -102,6 +102,17 @@ def sync_week(L, w, live, done):
         keep.update(t.get("players") or [])
         keep.update(t.get("starters") or [])
     games = games_for(season, w)
+    # a round can span more than one NBA week (e.g. the championship): pull in
+    # following weeks until every locked game is covered
+    locked = {g for t in legs for g in (t.get("starters_games") or {}).values()}
+    for extra in (1, 2):
+        have = {g[0] for g in games}
+        if not (locked - have):
+            break
+        more = [g for g in games_for(season, w + extra) if g[0] not in have]
+        if not more:
+            break
+        games = sorted(games + more, key=lambda x: (x[1], x[0]))
     old_status = {g[0]: g[2] for g in prev.get("games", [])}
     pts = {pid: list(v) for pid, v in (prev.get("pts") or {}).items()} if prev.get("v") == V else {}
     scoring = L.get("scoring_settings") or {}
