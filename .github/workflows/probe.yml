@@ -14,10 +14,8 @@ jobs:
         run: |
           mkdir -p probe; rm -f probe/*
           q() { curl -s -H Content-Type:application/json -H "Authorization: $T" -H Origin:https://sleeper.com -X POST https://sleeper.com/graphql --data "$2" > probe/$1.json; }
-          q stat_type '{"query":"{ __type(name: \"Stat\") { fields { name } } }"}'
-          q game '{"query":"query q { game_stats(sport: \"nba\", season_type: \"regular\", season: \"2026\", game_id: \"1393723757700317184\", category: \"stat\", order_by: \"pts\") { player_id game_id stats week date team opponent } }"}'
-          q wk '{"query":"query q { stats_for_players_in_week(sport: \"nba\", season_type: \"regular\", season: \"2026\", week: 1, category: \"stat\", player_ids: [\"1648\",\"1178\"]) { player_id game_id stats week date } }"}'
-          curl -s https://api.sleeper.app/v1/league/1342346419675078656 | jq -c .scoring_settings > probe/scoring.json
+          q score_type '{"query":"{ __type(name: \"Score\") { fields { name } } }"}'
+          q scores '{"query":"query q { scores(sport: \"nba\", season_type: \"regular\", season: \"2026\", week: 1) { game_id date status start_time metadata } }"}'
           head -c 800 probe/*.json
       - run: |
           git config user.name probe; git config user.email probe@users.noreply.github.com
