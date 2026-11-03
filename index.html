@@ -151,7 +151,7 @@ footer{color:var(--muted);font-size:12px;text-align:center;padding:30px 0 40px;b
   </nav>
 </header>
 <main class="wrap" id="main"><div class="load"><div class="disp" style="font-size:34px">Building the league archive</div><div class="bar"><i id="lbar"></i></div><div class="muted" id="lmsg">Starting…</div></div></main>
-<footer class="wrap">Live data from Sleeper. Odds are model estimates, for entertainment only.</footer>
+<footer class="wrap">Live data from Sleeper, scored with Lock-In rules. Odds are model estimates, for entertainment only.</footer>
 
 <script>
 /* ================= config ================= */
@@ -159,10 +159,11 @@ const LEAGUE_ID = "1342346419675078656";
 const API = "https://api.sleeper.app/v1";
 const REFRESH_MS = 60_000;
 const SIMS = 4000;
-const CACHE_V = "v2";
+const CACHE_V = "v3";
+const DATA_REPO = "rbg52699/dynasty-league", DATA_BRANCH = "data";
 
 /* ================= utils ================= */
-const D = { players:{}, state:null, seasons:[], cur:null, R:null, sim:null, open:new Set(), sort:{k:"titles",d:-1}, reqs:0, done:0 };
+const D = { raw:{}, idx:null, sha:null, players:{}, state:null, seasons:[], cur:null, R:null, sim:null, open:new Set(), sort:{k:"titles",d:-1}, reqs:0, done:0 };
 const store = { get(k){try{return JSON.parse(localStorage.getItem(k))}catch{return null}}, set(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch{}} };
 const esc = s => String(s ?? "").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const num = (a,b) => (a||0)+(b||0)/100;
@@ -183,7 +184,7 @@ function american(p, vig=1.045){
   if (q >= 0.995) return "LOCK";
   const v = q >= 0.5 ? -100*q/(1-q) : 100*(1-q)/q;
   const r = Math.abs(v) >= 1000 ? Math.round(v/50)*50 : Math.round(v/5)*5;
-  return r > 0 ? `+${Math.min(r,99999)}` : `${r}`;
+  return r > 0 ? `+${Math.min(r,10000)}` : `${Math.max(r,-10000)}`;
 }
 const pname = id => (D.players[id]||{}).n || (id==="0"?"Empty":`#${id}`);
 
@@ -200,10 +201,51 @@ const starterSum = m => (m.starters_points && m.starters_points.length) ? Math.r
 const cM = m => ({r:m.roster_id, m:m.matchup_id, p:starterSum(m), s:m.starters||[], sp:m.starters_points||[], pl:m.players||[], pp:m.players_points||{}});
 const cT = t => ({t:t.type, c:t.status_updated||t.created||0, a:t.adds||null, d:t.drops||null, r:t.roster_ids||[], dp:(t.draft_picks||[]).map(p=>({s:p.season,r:p.round,o:p.owner_id,f:p.previous_owner_id}))});
 
+/* ---- lock-in data (synced from Sleeper by the GitHub job into the `data` branch) ---- */
+async function dataSha(){
+  try { const r = await fetch(`https://api.github.com/repos/${DATA_REPO}/commits/${DATA_BRANCH}`, {cache:"no-cache", headers:{Accept:"application/vnd.github+json"}}); if (r.ok) return (await r.json()).sha; } catch {}
+  return null;
+}
+async function dataGet(path){
+  const ref = D.sha || DATA_BRANCH;
+  const url = `https://raw.githubusercontent.com/${DATA_REPO}/${ref}/${path}` + (D.sha ? "" : `?t=${Math.floor(Date.now()/60000)}`);
+  const r = await fetch(url); if (!r.ok) throw new Error(`${path} → HTTP ${r.status}`); return r.json();
+}
+// Turn one synced week into the matchup format the rest of the site uses.
+// Each starter counts one game: the locked game, otherwise their latest game
+// (which becomes the final game once the week is over).
+function fromLock(d){
+  const games = {}; for (const g of d.games) games[g[0]] = { start:g[1], status:g[2], home:g[3], away:g[4] };
+  return d.teams.map(t=>{
+    const gl = pid => d.pts[pid] || [];
+    const lk = {}, sp = [];
+    for (const pid of t.s) {
+      if (!pid || pid === "0") { sp.push(0); continue; }
+      const lst = gl(pid);
+      if (t.lk[pid]) { lk[pid] = "L"; sp.push((lst.find(x=>x[0]===t.lk[pid])||[0,0])[1]); }
+      else if (lst.length) { lk[pid] = d.final ? "F" : (games[lst[lst.length-1][0]]||{}).status==="in_progress" ? "G" : "P"; sp.push(lst[lst.length-1][1]); }
+      else { lk[pid] = d.final ? "F" : "N"; sp.push(0); }
+    }
+    let extra = 0; // locked players who have since left the lineup still count
+    for (const [pid,gid] of Object.entries(t.lk)) if (!t.s.includes(pid)) extra += (gl(pid).find(x=>x[0]===gid)||[0,0])[1];
+    const calc = Math.round((sp.reduce((a,b)=>a+b,0) + extra)*100)/100;
+    const pp = {}; for (const pid of t.pl) { const l = gl(pid); pp[pid] = l.length ? Math.max(...l.map(x=>x[1])) : 0; }
+    const glm = {}; for (const pid of new Set([...t.s, ...t.pl, ...Object.keys(t.lk)])) glm[pid] = gl(pid);
+    return { r:t.r, m:t.m, p: (d.final && t.off != null) ? t.off : calc, s:t.s, sp, pl:t.pl, pp, lk, lkg:t.lk, gl:glm, extra, games, fin:d.final, lock:true };
+  });
+}
+async function lockWeeks(id, ws){
+  const out = {}; D.raw[id] ||= {};
+  const files = await pool(ws.map(w=>()=>dataGet(`data/w/${id}/${w}.json`).catch(()=>null)), 6);
+  files.forEach((d,i)=>{ if (d && d.teams && d.teams.length) { out[ws[i]] = fromLock(d); D.raw[id][ws[i]] = d.pts; } });
+  return out;
+}
+
 async function loadSeason(L){
   const id = L.league_id, isCurrent = id === LEAGUE_ID, done = L.status === "complete";
   const key = `sl_season_${CACHE_V}_${id}`;
-  if (done) { const c = store.get(key); if (c) return {...c, L, isCurrent}; }
+  const lockIdx = D.idx && D.idx.leagues && D.idx.leagues[id];
+  if (done) { const c = store.get(key); if (c) { if (lockIdx) c.weeks = await lockWeeks(id, lockIdx.weeks); return {...c, L, isCurrent}; } }
   const [users, rosters, wb, lb] = await Promise.all([
     j(`/league/${id}/users`), j(`/league/${id}/rosters`),
     j(`/league/${id}/winners_bracket`).catch(()=>[]), j(`/league/${id}/losers_bracket`).catch(()=>[])
@@ -212,19 +254,30 @@ async function loadSeason(L){
   const liveWeek = (!done && sameSeason && L.status === "in_season") ? (st.display_week || st.week || 0) : 0;
   const pws = +(L.settings||{}).playoff_week_start || 0;
   const maxW = done ? Math.min(30, (L.settings||{}).last_scored_leg || 25) : Math.max(liveWeek, pws ? pws-1 : 0);
-  const wk = await pool(Array.from({length:maxW},(_,i)=>()=>j(`/league/${id}/matchups/${i+1}`).catch(()=>[])));
-  const weeks = {}; wk.forEach((a,i)=>{ if (a && a.length) weeks[i+1] = a.map(cM); });
+  let weeks = {};
+  if (lockIdx) {
+    weeks = await lockWeeks(id, lockIdx.weeks);
+    // future weeks: Sleeper's public schedule (pairings only), used for the season simulation
+    const fut = Array.from({length:Math.max(0,maxW)},(_,i)=>i+1).filter(w=>!weeks[w] && w > liveWeek);
+    const wk = await pool(fut.map(w=>()=>j(`/league/${id}/matchups/${w}`).catch(()=>[])));
+    wk.forEach((a,i)=>{ if (a && a.length) weeks[fut[i]] = a.map(m=>({...cM(m), p:0, sp:[], pp:{}})); });
+  } else {
+    const wk = await pool(Array.from({length:maxW},(_,i)=>()=>j(`/league/${id}/matchups/${i+1}`).catch(()=>[])));
+    wk.forEach((a,i)=>{ if (a && a.length) weeks[i+1] = a.map(cM); });
+  }
   const seenTx = new Set();
   const tx = (await pool(Array.from({length:31},(_,i)=>()=>j(`/league/${id}/transactions/${i}`).catch(()=>[]))))
               .flat().filter(t=>{ if (!t || t.status!=="complete") return false; const k=t.transaction_id||`${t.created}|${JSON.stringify(t.adds)}|${JSON.stringify(t.drops)}`; if (seenTx.has(k)) return false; seenTx.add(k); return true; }).map(cT);
   const s = { id, year:String(L.season), users, rosters, weeks, wb:wb||[], lb:lb||[], tx, liveWeek };
-  if (done) store.set(key, s);
+  if (done) store.set(key, {...s, weeks: lockIdx ? {} : weeks});
   return { ...s, L, isCurrent };
 }
 
 async function loadAll(){
   D.state = await j("/state/nba");
   const playersP = loadPlayers();
+  D.sha = await dataSha();
+  D.idx = await dataGet("data/index.json").catch(()=>null);
   const chain = []; let id = LEAGUE_ID;
   while (id && id !== "0" && chain.length < 20) { const L = await j(`/league/${id}`); chain.push(L); id = L.previous_league_id; }
   D.players = await playersP;
@@ -241,11 +294,17 @@ async function refreshLive(){
   s.liveWeek = (L.status==="in_season" && sameSeason) ? (D.state.display_week || D.state.week || 0) : 0;
   const [rosters, users] = await Promise.all([j(`/league/${id}/rosters`), j(`/league/${id}/users`)]);
   s.rosters = rosters; s.users = users;
+  const sha = await dataSha();
+  if (D.idx && sha && sha !== D.sha) {
+    D.sha = sha;
+    D.idx = await dataGet("data/index.json").catch(()=>D.idx);
+    const li = D.idx.leagues[id];
+    if (li) { const ws = li.weeks.filter(w=>w >= (s.liveWeek||li.live) - 1); Object.assign(s.weeks, await lockWeeks(id, ws)); }
+  } else if (!D.idx && s.liveWeek) {
+    const m = await j(`/league/${id}/matchups/${s.liveWeek}`); if (m && m.length) s.weeks[s.liveWeek] = m.map(cM);
+  }
   if (s.liveWeek) {
-    const [m, tx] = await Promise.all([j(`/league/${id}/matchups/${s.liveWeek}`), j(`/league/${id}/transactions/${s.liveWeek}`).catch(()=>[])]);
-    if (m && m.length) s.weeks[s.liveWeek] = m.map(cM);
-    // refresh the previous week too, in case it just finalized
-    if (s.liveWeek > 1) { const pm = await j(`/league/${id}/matchups/${s.liveWeek-1}`).catch(()=>null); if (pm && pm.length) s.weeks[s.liveWeek-1] = pm.map(cM); }
+    const tx = await j(`/league/${id}/transactions/${s.liveWeek}`).catch(()=>[]);
     const fresh = (tx||[]).filter(t=>t.status==="complete").map(cT);
     const seen = new Set(s.tx.map(t=>t.c+"|"+JSON.stringify(t.a)+JSON.stringify(t.d)));
     for (const t of fresh) if (!seen.has(t.c+"|"+JSON.stringify(t.a)+JSON.stringify(t.d))) s.tx.push(t);
@@ -313,6 +372,8 @@ function build(){
     s.games.sort((a,b)=>a.w-b.w);
     for (const g of s.games) {
       if (!g.complete) continue;
+      // skip consolation games after elimination (no lineups set, they skew the records)
+      if (g.po && s.poTeams.size && !(s.poTeams.has(g.a.r) && s.poTeams.has(g.b.r))) continue;
       R.games.push({ g, margin:Math.abs(g.a.p-g.b.p) });
       for (const [me,op] of [[g.a,g.b],[g.b,g.a]]) {
         const oid = s.own[me.r], m = mgr(oid), oo = s.own[op.r];
@@ -363,18 +424,49 @@ function buildModel(){
     const own = R.tw.filter(x=>x.s===s && x.rid===r.roster_id && !x.po).map(x=>x.pts);
     mu[r.roster_id] = (own.length*avg(own) + 3*mean) / (own.length + 3);
   }
-  D.model = { mean, cv, mu };
+  // per-player fantasy points per game, for the live lock-in projection
+  const pg = {}, add = (raw, wt) => { for (const wk of Object.values(raw||{})) for (const [pid,l] of Object.entries(wk)) for (const [,p] of l) { const x = pg[pid] ||= {n:0,s:0}; x.n += wt; x.s += p*wt; } };
+  const prevS = D.seasons[D.seasons.indexOf(s)-1];
+  add(D.raw[s.id], 1); if (prevS) add(D.raw[prevS.id], 0.25);
+  const all = Object.values(pg); const lgAvg = all.length ? all.reduce((a,x)=>a+x.s,0)/all.reduce((a,x)=>a+x.n,0) : 25;
+  const pavg = pid => { const x = pg[pid]; return x ? (x.s + 3*lgAvg*0.8)/(x.n + 3) : lgAvg*0.8; };
+  D.model = { mean, cv, mu, pavg };
+}
+// How many of a player's NBA games are still to be played this week.
+function gamesLeft(pid, games){ const tm = (D.players[pid]||{}).tm; if (!tm || !games) return 0; let n=0; for (const g of Object.values(games)) if (g.status!=="complete" && g.status!=="in_progress" && (g.home===tm || g.away===tm)) n++; return n; }
+// Expected best-of-k: value of waiting for one of k future games (rough optimal-stopping uplift).
+const UPLIFT = [0, 0, .40, .62, .75, .85, .92];
+// Project a team's final lock-in score: locked/finished starters are fixed; the rest are
+// worth the better of their current (lockable) game or what they'd get by waiting.
+function projSide(x){
+  const { pavg } = D.model; let mu = x.extra||0, v = 0;
+  x.s.forEach((pid,i)=>{
+    if (!pid || pid === "0") return;
+    const k = x.lk[pid], cur = x.sp[i] || 0;
+    if (k === "L" || k === "F") { mu += cur; return; }
+    const rem = gamesLeft(pid, x.games), a = pavg(pid), sd = 0.42*a;
+    if (!rem) { mu += cur; if (k === "G") v += (0.25*a)**2; return; }
+    const wait = a + sd*UPLIFT[Math.min(rem, 6)];
+    if (k === "P" && cur >= wait) { mu += cur; v += (0.15*sd)**2; }
+    else { mu += k === "P" ? Math.max(cur, wait) : wait; v += sd*sd*(rem > 1 ? 0.75 : 1); }
+  });
+  return { mu, v };
 }
 function line(g){
   const { mu, cv } = D.model;
   const live = g.live, f = live ? (((g.a.p||0)+(g.b.p||0))>0 ? weekFrac() : 0) : 0;
   if (g.complete) { const pa = g.a.p>g.b.p?1:g.a.p<g.b.p?0:.5; return { pa, pb:1-pa, ea:g.a.p, eb:g.b.p, pre:pa, f:1 }; }
   const ma = mu[g.a.r], mb = mu[g.b.r];
+  const pre = Phi((ma-mb)/Math.sqrt((cv*ma)**2+(cv*mb)**2));
+  if (live && g.a.lock && g.b.lock) {
+    const A = projSide(g.a), B = projSide(g.b), sd = Math.sqrt(A.v + B.v) || 1e-9;
+    const pa = A.v + B.v < 1e-6 ? (A.mu>B.mu?1:A.mu<B.mu?0:.5) : Phi((A.mu-B.mu)/sd);
+    return { pa, pb:1-pa, ea:A.mu, eb:B.mu, sa:Math.sqrt(A.v), sb:Math.sqrt(B.v), pre, f:0 };
+  }
   const ea = (live?g.a.p:0) + ma*(1-f), eb = (live?g.b.p:0) + mb*(1-f);
   const sd = Math.sqrt(((cv*ma)**2 + (cv*mb)**2)*(1-f)) || 1e-9;
   const pa = Phi((ea-eb)/sd);
-  const pre = Phi((ma-mb)/Math.sqrt((cv*ma)**2+(cv*mb)**2));
-  return { pa, pb:1-pa, ea, eb, pre, f };
+  return { pa, pb:1-pa, ea, eb, sa:cv*ma*Math.sqrt(1-f), sb:cv*mb*Math.sqrt(1-f), pre, f };
 }
 function bracketOrder(n){ let a=[1]; while(a.length<n){ const L=a.length*2; a=a.flatMap(x=>[x, L+1-x]); } return a; }
 function simBracket(seeds, mu, cv, out){
@@ -413,9 +505,9 @@ function simulate(){
     else {
       const W={...baseW}, PF={...basePF};
       for (const g of reg) {
-        const ff = g.live && (g.a.p+g.b.p)>0 ? f : 0;
-        const sa = (g.live?g.a.p:0) + mu[g.a.r]*(1-ff) + cv*mu[g.a.r]*Math.sqrt(1-ff)*randn();
-        const sb = (g.live?g.b.p:0) + mu[g.b.r]*(1-ff) + cv*mu[g.b.r]*Math.sqrt(1-ff)*randn();
+        let sa, sb;
+        if (g.live) { const Lg = g._L || (g._L = line(g)); sa = Lg.ea + Lg.sa*randn(); sb = Lg.eb + Lg.sb*randn(); }
+        else { sa = mu[g.a.r]*(1+cv*randn()); sb = mu[g.b.r]*(1+cv*randn()); }
         PF[g.a.r]+=sa; PF[g.b.r]+=sb; if (sa>sb) W[g.a.r]++; else W[g.b.r]++;
       }
       for (const _ of missing) {
@@ -447,6 +539,15 @@ function mchip(m, sub){
 const rec = (s, rid) => { const t=s.rank[rid]; return t ? `${t.w}-${t.l}${t.t?`-${t.t}`:""}` : ""; };
 const when = (s, w) => `${s.year} · Wk ${w}${w>=s.pws?" · Playoffs":""}`;
 const sec = (title, sub="") => `<div class="sec"><h2 class="disp">${title}</h2><span class="muted">${sub}</span></div>`;
+const LK = { L:["🔒","Locked","var(--green)"], F:["","Final game","var(--muted)"], P:["⏳","Can lock","var(--orange)"], G:["●","Playing","var(--red)"], N:["","No game yet","var(--muted)"] };
+function plrL(x, id, i){
+  const st = x.lk && x.lk[id], t = st ? LK[st] : null;
+  const left = x.lock && !x.fin && st !== "L" ? gamesLeft(id, x.games) : 0;
+  const lbl = st==="L" ? "🔒" : st==="G" ? "● live" : st==="P" ? `⏳${left?` ${left}`:""}` : st==="N" ? (left?`${left} left`:"—") : "";
+  const tag = t && lbl ? `<span title="${t[1]}${left?` · ${left} game${left>1?"s":""} left`:""}" style="color:${t[2]};font-size:10px;font-weight:700;margin-left:5px">${lbl}</span>` : "";
+  const p = D.players[id] || {};
+  return `<div class="p"><span><span class="ps">${esc((p.pos||[]).slice(0,2).join("/"))}</span>${esc(pname(id))}${p.inj?`<span class="inj">${esc(p.inj)}</span>`:""}${tag}</span><b>${f1(x.sp[i])}</b></div>`;
+}
 function plr(id, pts){
   const p = D.players[id] || {};
   return `<div class="p"><span><span class="ps">${esc((p.pos||[]).slice(0,2).join("/"))}</span>${esc(pname(id))}${p.inj?`<span class="inj">${esc(p.inj)}</span>`:""}</span>${pts!=null?`<b>${f1(pts)}</b>`:""}</div>`;
@@ -464,9 +565,11 @@ function matchCard(g, gotw){
   };
   const sp = L.ea - L.eb, fav = sp >= 0 ? g.a : g.b;
   const detail = x => {
-    const starters = x.s.map((id,i)=>plr(id, x.sp[i] ?? x.pp[id]));
-    const bench = x.pl.filter(id=>!x.s.includes(id)).sort((a,b)=>(x.pp[b]||0)-(x.pp[a]||0)).map(id=>plr(id, x.pp[id]));
-    return `<div><div class="k" style="margin-bottom:4px">${esc(T(s,x.r).name)}</div>${starters.join("")}${bench.length?`<div class="k" style="margin:8px 0 4px">Bench</div>${bench.join("")}`:""}</div>`;
+    const starters = x.s.map((id,i)=> id && id!=="0" ? (x.lock ? plrL(x,id,i) : plr(id, x.sp[i] ?? x.pp[id])) : "");
+    const benchAll = x.pl.filter(id=>!x.s.includes(id)).sort((a,b)=>(x.pp[b]||0)-(x.pp[a]||0)).map(id=>plr(id, x.pp[id]));
+    const bench = benchAll.length > 5 ? [...benchAll.slice(0,5), `<details onclick="event.stopPropagation()"><summary style="margin-top:4px">${benchAll.length-5} more</summary>${benchAll.slice(5).join("")}</details>`] : benchAll;
+    const nL = x.lock ? Object.values(x.lk).filter(v=>v==="L").length : 0, nS = x.s.filter(id=>id&&id!=="0").length;
+    return `<div><div class="k" style="margin-bottom:4px">${esc(T(s,x.r).name)}${x.lock && !x.fin ? ` · <span style="color:var(--green)">${nL}/${nS} locked</span>` : ""}</div>${starters.join("")}${bench.length?`<div class="k" style="margin:8px 0 4px">Bench <span style="text-transform:none;letter-spacing:0">(best game)</span></div>${bench.join("")}`:""}</div>`;
   };
   return `<div class="card mc ${gotw?"gotw":""} ${open?"open":""}" data-k="${g.key}">
     <div class="mh">${status}${gotw?`<span class="badge gold">★ Game of the week</span>`:""}</div>
@@ -489,9 +592,22 @@ function storylines(s, games){
   const sides = games.flatMap(g=>[g.a,g.b]);
   const hot = [...sides].sort((a,b)=>b.p-a.p)[0];
   if (hot && hot.p>0) out.push(["🔥",s.liveWeek?"Top score so far":"Top score",`${esc(T(s,hot.r).name)}`,`${s.liveWeek?"Leading the league with":"Put up"} ${f2(hot.p)} this week.`]);
-  const bench = sides.map(x=>({x, b:x.pl.filter(id=>!x.s.includes(id)).reduce((a,id)=>a+(+x.pp[id]||0),0)})).sort((a,b)=>b.b-a.b)[0];
-  if (bench && bench.b>0) out.push(["🪑","Bench mob",`${esc(T(s,bench.x.r).name)}`,`${f1(bench.b)} points sitting on the bench this week.`]);
+  const bench = sides.flatMap(x=>x.pl.filter(id=>!x.s.includes(id)).map(id=>({x, id, b:+x.pp[id]||0}))).sort((a,b)=>b.b-a.b)[0];
+  if (bench && bench.b>0) out.push(["🪑","Best game on a bench",`${esc(pname(bench.id))} · ${f1(bench.b)}`,`Wasted on ${esc(T(s,bench.x.r).name)}'s bench.`]);
   const big = lines.filter(x=>!x.g.complete).sort((a,b)=>Math.max(b.L.pa,b.L.pb)-Math.max(a.L.pa,a.L.pb))[0];
+  // lock-in storylines: the best lock so far, and the lock that aged worst
+  const lockSides = games.flatMap(g=>[g.a,g.b]).filter(x=>x.lock);
+  if (lockSides.length) {
+    let best = null, regret = null;
+    for (const x of lockSides) for (const [pid,gid] of Object.entries(x.lkg||{})) {
+      const l = x.gl[pid] || [], i = l.findIndex(z=>z[0]===gid); if (i < 0) continue;
+      const v = l[i][1]; if (!best || v > best.v) best = { x, pid, v };
+      const later = Math.max(-Infinity, ...l.slice(i+1).map(z=>z[1]));
+      if (later > v && (!regret || later - v > regret.d)) regret = { x, pid, v, later, d: later - v };
+    }
+    if (regret && out.length < 4) out.splice(Math.min(2,out.length), 0, ["😭","Lock regret",`${esc(pname(regret.pid))}`,`${esc(T(s,regret.x.r).name)} locked ${f1(regret.v)}, then watched him drop ${f1(regret.later)}.`]);
+    if (best && out.length < 4) out.push(["💰","Best lock",`${esc(pname(best.pid))} · ${f1(best.v)}`,`Locked in by ${esc(T(s,best.x.r).name)}.`]);
+  }
   if (big && out.length<4) { const A = big.L.pa>=.5; out.push(["🔒","Lock of the week",`${esc(T(s,(A?big.g.a:big.g.b).r).name)}`,`${pct(A?big.L.pa:big.L.pb)} to win. Book it (don't actually book it).`]); }
   return `<div class="grid c4 stories">${out.slice(0,4).map(([e,k,h,p])=>`<div class="card story"><div class="em">${e}</div><div class="k" style="margin-top:6px">${k}</div><div class="h disp">${h}</div><p>${p}</p></div>`).join("")}</div>`;
 }
@@ -546,7 +662,7 @@ function vOdds(){
       ${rows.map((t,i)=>`<tr><td class="rk">${i+1}</td><td>${chip(s,t.rid)}</td><td class="n">${t.w}-${t.l}${t.t?`-${t.t}`:""}</td>${sim.inPO?"":`<td class="n">${f1(sim.wins[t.rid])}</td><td class="n">${pct(sim.po[t.rid])}</td><td class="n">${pct(sim.top[t.rid])}</td>`}<td class="n">${pct(sim.final[t.rid])}</td><td class="n"><b>${pct(sim.champ[t.rid])}</b></td><td class="n"><b class="${sim.champ[t.rid]>=.2?"pos":"gold"}">${american(sim.champ[t.rid],1.15)}</b></td></tr>`).join("")}
     </tbody></table><div class="note">Based on ${SIMS.toLocaleString()} simulations of the rest of the season, using each team's scoring this year (pulled toward the league average early on), today's live scores, and the remaining schedule. Odds include a house edge, so the implied percentages run a little high.</div></div>`;
   }
-  return `<div class="hero"><div><div class="k">The Sportsbook</div><div class="big disp">${esc(s.L.name)} odds</div><div class="muted" style="margin-top:6px">Refreshes every minute. Fake money only.</div></div></div>
+  return `<div class="hero"><div><div class="k">The Sportsbook</div><div class="big disp">${esc(s.L.name)} odds</div><div class="muted" style="margin-top:6px">Live lines account for who has locked and how many games each starter has left. Fake money only.</div></div></div>
     ${sec("Championship futures", sim&&sim.inPO?"Playoffs are live":"")}${fut}
     ${sec(`Week ${s.liveWeek||"—"} board`, "Spreads and totals are projected finals")}${board}`;
 }
@@ -608,7 +724,7 @@ function vManagers(){
   </div>`;
   const table = `<div class="card tw"><table><thead><tr>${cols.map(([k,l,c])=>`<th class="s ${c||""} ${sk===k?"on":""}" data-sort="${k}">${l}${sk===k?(sd<0?" ↓":" ↑"):""}</th>`).join("")}</tr></thead><tbody>
     ${rows.map(r=>`<tr><td>${mchip(r, `@${esc(r.handle)}${r.active?"":" · retired"}`)}</td><td class="n">${r.titles?`<b class="gold">${r.titles}</b>`:"0"}</td><td class="n">${r.finals}</td><td class="n">${r.po}</td><td class="n">${r.w}-${r.l}${r.t?`-${r.t}`:""}</td><td class="n">${(r.wp*100).toFixed(1)}%</td><td class="n">${r.poW}-${r.poL}</td><td class="n">${f1(r.pf)}</td><td class="n">${f1(r.avgpf)}</td><td class="n">${r.eff!=null?(r.eff*100).toFixed(1)+"%":"—"}</td><td class="n">${f1(r.left)}</td><td class="n">${r.moves}</td><td class="n">${r.trades}</td></tr>`).join("")}
-  </tbody></table><div class="note">Click a column to sort. <b>Efficiency</b> is points scored divided by the best possible lineup from the same roster each week, estimated from weekly totals.</div></div>`;
+  </tbody></table><div class="note">Click a column to sort. <b>Efficiency</b> is points scored divided by the best possible score from the same roster each week, with perfect lineup and lock timing.</div></div>`;
   // head-to-head
   const act = rows.filter(r=>r.active).sort((a,b)=>a.name.localeCompare(b.name));
   const h2h = act.length > 1 ? `${sec("Head-to-head", "Row manager's record against column manager, all games")}
@@ -736,7 +852,8 @@ function header(){
     document.getElementById("track").innerHTML = items + items;
   } else tk.style.display = "none";
 }
-function recompute(){ build(); if (D.cur) { buildModel(); simulate(); } header(); render(); document.getElementById("upd").textContent = "Updated " + new Date().toLocaleTimeString([], {hour:"numeric",minute:"2-digit"}); }
+function recompute(){ build(); if (D.cur) { buildModel(); simulate(); } header(); render(); const u = D.idx && D.idx.updated; const ago = u ? Math.max(0, Math.round((Date.now()-u)/60000)) : null;
+  document.getElementById("upd").textContent = u ? `Lock-in scores synced ${ago < 1 ? "just now" : ago + " min ago"}` : "Updated " + new Date().toLocaleTimeString([], {hour:"numeric",minute:"2-digit"}); }
 
 document.addEventListener("click", e => {
   const th = e.target.closest("th[data-sort]");
