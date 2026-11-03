@@ -12,14 +12,14 @@ jobs:
       - uses: actions/checkout@v4
       - name: Probe Sleeper GraphQL
         run: |
-          mkdir -p debug/probe
+          mkdir -p debug/probe2
           G=https://sleeper.com/graphql
-          H='-H Content-Type:application/json -H Origin:https://sleeper.com -H Referer:https://sleeper.com/'
-          curl -s $H -X POST $G -d '{"query":"{ __schema { queryType { fields { name args { name } } } } }"}' > debug/probe/schema.json || true
-          curl -s $H -X POST $G -d '{"operationName":"q","variables":{},"query":"query q { matchup_legs(league_id: \"1342346419675078656\", round: 2) { roster_id points starters starters_points player_map } }"}' > debug/probe/legs.json || true
-          curl -s $H -X POST $G -d '{"operationName":"q","variables":{},"query":"query q { league_rosters(league_id: \"1342346419675078656\") { roster_id settings } }"}' > debug/probe/rosters.json || true
-          curl -s https://api.sleeper.com/league/1342346419675078656/matchups/2 > debug/probe/apicom_matchups.json || true
-          head -c 600 debug/probe/*.json
+          q() { curl -s -H Content-Type:application/json -H Origin:https://sleeper.com -X POST $G --data "$2" > debug/probe2/$1.json; }
+          q type_leg '{"query":"{ __type(name: \"MatchupLeg\") { fields { name type { name kind of_type { name kind } } } } }"}'
+          q legs2 '{"query":"query q { matchup_legs(league_id: \"1342346419675078656\", round: 2) { roster_id matchup_id leg round points proj_points max_points starters starters_games player_map } }"}'
+          q legs1 '{"query":"query q { matchup_legs(league_id: \"1342346419675078656\", round: 1) { roster_id matchup_id points starters starters_games } }"}'
+          q legs_prev '{"query":"query q { matchup_legs(league_id: \"1207385949281984512\", round: 5) { roster_id matchup_id points starters starters_games } }"}'
+          q type_q '{"query":"{ __schema { query_type { fields { name args { name } } } } }"}'
       - name: Commit
         run: |
           git config user.name "github-actions"; git config user.email "github-actions@users.noreply.github.com"
