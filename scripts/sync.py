@@ -191,6 +191,33 @@ def main():
         weeks = sorted(int(f[:-5]) for f in os.listdir(f"data/w/{lid}")) if os.path.isdir(f"data/w/{lid}") else []
         index[lid] = {"season": str(L["season"]), "weeks": weeks, "live": live}
         print(f"{L['season']}: {len(weeks)} weeks, {mism} mismatched team-weeks")
+    # league details + player names/teams for the lock advisor skill
+    cur = leagues[0]
+    try:
+        users = {u["user_id"]: u for u in rest(f"/league/{cur['league_id']}/users")}
+        rosters = rest(f"/league/{cur['league_id']}/rosters")
+        teams = {}
+        for r in rosters:
+            u = users.get(r.get("owner_id")) or {}
+            teams[str(r["roster_id"])] = {"name": (u.get("metadata") or {}).get("team_name") or u.get("display_name") or f"Team {r['roster_id']}",
+                                          "owner": u.get("display_name") or "", "players": r.get("players") or [],
+                                          "reserve": r.get("reserve") or [], "taxi": r.get("taxi") or []}
+        changed += write("data/league.json", {"league_id": cur["league_id"], "season": str(cur["season"]),
+                                              "roster_positions": cur.get("roster_positions") or [],
+                                              "live_week": index.get(cur["league_id"], {}).get("live", 0), "teams": teams})
+        pl = load("data/players.json") or {}
+        if time.time() - (pl.get("_t") or 0) > 3 * 3600:
+            raw = rest("/players/nba")
+            keep = {p for t in teams.values() for p in t["players"]}
+            out = {"_t": int(time.time())}
+            for pid, x in raw.items():
+                if pid in keep or x.get("team"):
+                    out[pid] = {"n": x.get("full_name") or f"{x.get('first_name','')} {x.get('last_name','')}".strip(),
+                                "pos": x.get("fantasy_positions") or ([x["position"]] if x.get("position") else []),
+                                "tm": x.get("team") or "FA", "inj": x.get("injury_status") or ""}
+            changed += write("data/players.json", out)
+    except Exception as e:
+        print(f"league/players: {e}")
     # record when the login token expires (the expiry date only, never the token)
     exp = None
     try:
