@@ -16,7 +16,7 @@ LEAGUE_ID = "1342346419675078656"
 REST = "https://api.sleeper.app/v1"
 GQL = "https://sleeper.com/graphql"
 TOKEN = os.environ.get("SLEEPER_TOKEN", "").strip()
-V = 3  # bump to force every week to be rebuilt
+V = 4  # bump to force every week to be rebuilt
 
 
 def _req(req, tries=4):
@@ -81,10 +81,28 @@ def games_for(season, week):
     return sorted(out, key=lambda x: (x[1], x[0]))
 
 
+# raw box-score stats kept per game (for the awards page)
+SK = ["pts", "reb", "oreb", "dreb", "ast", "stl", "blk", "to", "tpm", "tpa", "fgm", "fga", "ftm", "fta", "min"]
+
+
+def statvec(st):
+    st = dict(st)
+    if not st.get("fga") and (st.get("fgm") or st.get("fgmi")):
+        st["fga"] = (st.get("fgm") or 0) + (st.get("fgmi") or 0)
+    if not st.get("fta") and (st.get("ftm") or st.get("ftmi")):
+        st["fta"] = (st.get("ftm") or 0) + (st.get("ftmi") or 0)
+    if not st.get("tpa") and (st.get("tpm") or st.get("tpmi")):
+        st["tpa"] = (st.get("tpm") or 0) + (st.get("tpmi") or 0)
+    if not st.get("reb"):
+        st["reb"] = (st.get("oreb") or 0) + (st.get("dreb") or 0)
+    return [round(float(st.get(k) or 0), 1) for k in SK]
+
+
 def game_points(season, gid, scoring, keep):
     q = f'query q {{ game_stats(sport: "nba", season_type: "regular", season: "{season}", game_id: "{gid}", category: "stat", order_by: "pts") {{ player_id stats }} }}'
     rows = gql(q)["game_stats"] or []
-    return {r["player_id"]: fpts(r.get("stats") or {}, scoring) for r in rows if r["player_id"] in keep}
+    return {r["player_id"]: (fpts(r.get("stats") or {}, scoring), statvec(r.get("stats") or {}))
+            for r in rows if r["player_id"] in keep}
 
 
 def sync_week(L, w, live, done):
@@ -92,7 +110,8 @@ def sync_week(L, w, live, done):
     path = f"data/w/{lid}/{w}.json"
     prev = load(path) or {}
     final = done or (live and w < live)
-    if final and prev.get("final") and prev.get("v") == V:
+    sx_path = f"data/sx/{lid}/{w}.json"
+    if final and prev.get("final") and prev.get("v") == V and os.path.exists(sx_path):
         return 0, None
     legs = legs_for(lid, w)
     if not legs:
@@ -115,6 +134,7 @@ def sync_week(L, w, live, done):
         games = sorted(games + more, key=lambda x: (x[1], x[0]))
     old_status = {g[0]: g[2] for g in prev.get("games", [])}
     pts = {pid: list(v) for pid, v in (prev.get("pts") or {}).items()} if prev.get("v") == V else {}
+    sx = (load(sx_path) or {}) if prev.get("v") == V else {}
     scoring = L.get("scoring_settings") or {}
     for gid, start, status, *_ in games:
         if status not in ("complete", "in_progress"):
@@ -126,10 +146,11 @@ def sync_week(L, w, live, done):
         except Exception as e:
             print(f"  game {gid}: {e}")
             continue
-        for pid, p in gp.items():
+        for pid, (p, vec) in gp.items():
             lst = [x for x in pts.get(pid, []) if x[0] != gid]
             lst.append([gid, p])
             pts[pid] = lst
+            sx.setdefault(pid, {})[gid] = vec
         time.sleep(0.08)
     start_of = {g[0]: g[1] for g in games}
     for pid in pts:
@@ -156,6 +177,8 @@ def sync_week(L, w, live, done):
             if t["off"] is not None and abs(calc - t["off"]) > 0.01:
                 diffs += 1
         check = diffs
+    sx = {pid: v for pid, v in sx.items() if pid in keep}
+    write(sx_path, sx)
     changed = write(path, {"v": V, "league_id": lid, "season": season, "week": w, "final": bool(final),
                            "live": bool(live and w == live), "teams": teams, "games": games, "pts": pts})
     return int(changed), check
@@ -189,6 +212,19 @@ def main():
                 mism += chk
                 print(f"{L['season']} week {w}: {chk} team score(s) differ from Sleeper's official total")
         weeks = sorted(int(f[:-5]) for f in os.listdir(f"data/w/{lid}")) if os.path.isdir(f"data/w/{lid}") else []
+        # season box-score totals per rostered player: [games, *SK sums]
+        tot, seen = {}, set()
+        for w in weeks:
+            for pid, gm in (load(f"data/sx/{lid}/{w}.json") or {}).items():
+                for gid, vec in gm.items():
+                    if (pid, gid) in seen or not any(vec):
+                        continue
+                    seen.add((pid, gid))
+                    t = tot.setdefault(pid, [0] + [0.0] * len(SK))
+                    t[0] += 1
+                    for i, v in enumerate(vec):
+                        t[i + 1] = round(t[i + 1] + v, 1)
+        changed += write(f"data/stats/{lid}.json", {"keys": ["g"] + SK, "players": tot})
         index[lid] = {"season": str(L["season"]), "weeks": weeks, "live": live}
         print(f"{L['season']}: {len(weeks)} weeks, {mism} mismatched team-weeks")
     # league details + player names/teams for the lock advisor skill
@@ -206,15 +242,16 @@ def main():
                                               "roster_positions": cur.get("roster_positions") or [],
                                               "live_week": index.get(cur["league_id"], {}).get("live", 0), "teams": teams})
         pl = load("data/players.json") or {}
-        if time.time() - (pl.get("_t") or 0) > 3 * 3600:
+        if time.time() - (pl.get("_t") or 0) > 3 * 3600 or pl.get("_v") != 2:
             raw = rest("/players/nba")
             keep = {p for t in teams.values() for p in t["players"]}
-            out = {"_t": int(time.time())}
+            out = {"_t": int(time.time()), "_v": 2}
             for pid, x in raw.items():
                 if pid in keep or x.get("team"):
                     out[pid] = {"n": x.get("full_name") or f"{x.get('first_name','')} {x.get('last_name','')}".strip(),
                                 "pos": x.get("fantasy_positions") or ([x["position"]] if x.get("position") else []),
-                                "tm": x.get("team") or "FA", "inj": x.get("injury_status") or ""}
+                                "tm": x.get("team") or "FA", "inj": x.get("injury_status") or "",
+                                "yx": x.get("years_exp"), "age": x.get("age")}
             changed += write("data/players.json", out)
     except Exception as e:
         print(f"league/players: {e}")
